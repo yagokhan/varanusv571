@@ -2,7 +2,7 @@ import requests
 
 # ── Entry alert ───────────────────────────────────────────────────────────────
 ALERT_FORMAT = (
-    "🦎 *VARANUS v5.7* | {asset} {direction} @ {confidence:.0%}\n"
+    "🦎 *VARANUS v5.7.1* | {asset} {direction} @ {confidence:.0%}\n"
     "Entry: {entry_price} | TP: {take_profit} | SL: {stop_loss}\n"
     "R:R {rr_ratio:.1f}x | Lev: {leverage}x | ATR: {atr_14:.4f}\n"
     "MSS: {mss} | FVG✓ | Sweep✓ | RVol: {rvol:.2f}x | RSI: {rsi:.1f}\n"
@@ -18,7 +18,7 @@ REQUIRED_FIELDS = [
 
 # ── Exit alert ────────────────────────────────────────────────────────────────
 EXIT_FORMAT = (
-    "🔒 *VARANUS v5.7 EXIT* | {asset} {outcome}\n"
+    "🔒 *VARANUS v5.7.1 EXIT* | {asset} {outcome}\n"
     "Entry: {entry_price:.4f} → Exit: {exit_price:.4f}\n"
     "PnL: {pnl_sign}${pnl_abs:.2f} | Duration: {duration_h:.0f}h\n"
     "Outcome: {outcome_label}"
@@ -26,7 +26,7 @@ EXIT_FORMAT = (
 
 # ── Circuit breaker alert ─────────────────────────────────────────────────────
 HALT_FORMAT = (
-    "🚨 *VARANUS v5.7 — SIGNALS HALTED*\n"
+    "🚨 *VARANUS v5.7.1 — SIGNALS HALTED*\n"
     "Daily Loss: {daily_loss_pct:.1f}% | Drawdown: {drawdown_pct:.1f}%\n"
     "Current Equity: ${current_equity:.2f}\n"
     "Reason: {reason}"
@@ -113,7 +113,7 @@ def send_no_signal_alert(cycle_time: str, equity: float, daily_pct: float,
                          dry_run: bool = False) -> None:
     """Send a no-signal notification at the end of each cycle."""
     msg = (
-        f"🔍 *VARANUS v5.7 — No Signal*\n"
+        f"🔍 *VARANUS v5.7.1 — No Signal*\n"
         f"Cycle: {cycle_time}\n"
         f"Scanned 15 assets — no setup above confidence threshold\n"
         f"Equity: ${equity:,.2f} | Daily: {daily_pct:+.1f}%"
@@ -150,7 +150,7 @@ def send_heartbeat_alert(state: dict, health: dict,
     pnl_icon    = "📈" if total_pnl >= 0 else "📉"
 
     lines = [
-        f"🐊 *VARANUS v5.7 The Golden Ratio — Status*",
+        f"🐊 *VARANUS v5.7.1 The Golden Ratio — Status*",
         f"_{now_utc}_",
         f"",
         f"*Portfolio*",
