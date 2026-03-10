@@ -1,0 +1,2 @@
+period,total_trades,long_trades,short_trades,total_return_pct,net_profit_usd,win_rate_pct,long_win_rate_pct,short_win_rate_pct,profit_factor,expectancy_usd,avg_win_usd,avg_loss_usd,max_drawdown_pct,sharpe_ratio,exits_sl,exits_mss_invalidation,exits_tp,exits_time
+Nov 01 2025 – Jan 24 2026,70,32,38,64.0,3200.02,42.86,46.88,39.47,2.18,44.72,197.05,-69.53,-9.91,3.884,33,14,12,11
