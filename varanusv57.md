@@ -230,7 +230,7 @@ v5.7/
 
 Credentials in `varanus/config/telegram.env`:
 ```
-VARANUS_BOT_TOKEN=8787028768:AAFlurgDAMoRihpbt1ewNiwio9Yb7URmTnk
+VARANUS_BOT_TOKEN=YOUR_TELEGRAM_BOT_TOKEN
 VARANUS_CHAT_ID=443025840
 ```
 Bot name: varanus6
