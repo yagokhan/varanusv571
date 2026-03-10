@@ -77,9 +77,12 @@ def send_exit_alert(trade: dict, bot_token: str, chat_id: str,
 
     outcome = trade.get("outcome", "unknown")
     outcome_labels = {
-        "tp":   "✅ Take-Profit Hit",
-        "sl":   "❌ Stop-Loss Hit",
-        "time": "⏱ Time Barrier (Force Close)",
+        "tp":               "✅ Take-Profit Hit",
+        "sl":               "❌ Stop-Loss Hit",
+        "time":             "⏱ Time Barrier (Force Close)",
+        "trailing_sl_hit":  "🔁 Trailing Stop Hit",
+        "signal_decay":     "📉 Signal Decay Exit",
+        "mss_invalidation": "⚡ MSS Invalidation Exit",
     }
 
     try:
