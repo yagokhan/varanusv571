@@ -468,6 +468,9 @@ class PaperTrader:
                 "position_usd": round(pos_usd, 2),
                 "entry_ts":     entry_ts.isoformat(),
                 "max_hold_ts":  max_hold_ts.isoformat(),
+                "trail_active": False,
+                "trail_peak":   None,
+                "trail_stop":   None,
             }
 
             # ── 3. Send Telegram entry alert with position size ────────────────
@@ -545,9 +548,43 @@ class PaperTrader:
                 else pd.Timestamp(trade["entry_ts"])
             bars_to_check = df[df.index > entry_ts]
 
+            TRAIL_TRIGGER_PCT  = 0.01147
+            TRAIL_DISTANCE_PCT = 0.01147
+
             outcome = None
             exit_ts = None
             for ts, bar in bars_to_check.iterrows():
+                d  = trade["direction"]
+                ep = trade["entry_price"]
+
+                # ── Trailing stop logic (v5.7.1) ──────────────────────────
+                if d == 1:  # LONG
+                    if (bar["high"] - ep) / ep >= TRAIL_TRIGGER_PCT:
+                        trade["trail_active"] = True
+                    if trade.get("trail_active"):
+                        peak = trade.get("trail_peak")
+                        if peak is None or bar["high"] > peak:
+                            trade["trail_peak"] = bar["high"]
+                            trade["trail_stop"] = bar["high"] * (1 - TRAIL_DISTANCE_PCT)
+                        if bar["close"] < trade["trail_stop"]:
+                            outcome = {"type": "trailing_sl_hit", "price": trade["trail_stop"]}
+                            exit_ts = ts
+                            break
+                elif d == -1:  # SHORT
+                    if (ep - bar["low"]) / ep >= TRAIL_TRIGGER_PCT:
+                        trade["trail_active"] = True
+                    if trade.get("trail_active"):
+                        peak = trade.get("trail_peak")
+                        if peak is None or bar["low"] < peak:
+                            trade["trail_peak"] = bar["low"]
+                            trade["trail_stop"] = bar["low"] * (1 + TRAIL_DISTANCE_PCT)
+                        if bar["close"] > trade["trail_stop"]:
+                            outcome = {"type": "trailing_sl_hit", "price": trade["trail_stop"]}
+                            exit_ts = ts
+                            break
+
+                if outcome:
+                    break
                 outcome = _check_barriers(bar, trade)
                 if outcome:
                     exit_ts = ts
@@ -561,7 +598,8 @@ class PaperTrader:
             # Net PnL (mirrors backtest._calculate_pnl)
             direction = trade["direction"]
             raw_ret   = direction * (exit_price - trade["entry_price"]) / trade["entry_price"]
-            fee       = 0.0005 if outcome["type"] == "sl" else 0.0002
+            taker_exits = ("sl", "signal_decay", "mss_invalidation", "trailing_sl_hit")
+            fee       = 0.0005 if outcome["type"] in taker_exits else 0.0002
             net_ret   = raw_ret - fee - 0.0008          # slippage
             pnl_usd   = trade["position_usd"] * net_ret
 
