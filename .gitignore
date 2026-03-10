@@ -1,0 +1,30 @@
+# Sensitive
+telegram.env
+*.env
+
+# Data cache (large parquet files — run fetch_all_data_v57.py to regenerate)
+varanus/data/cache/
+
+# Logs
+logs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Virtual environment
+varanus_env/
+algo_env/
+venv/
+.venv/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
