@@ -301,18 +301,30 @@ class PaperTrader:
 
     _BINANCE_KLINES = "https://api.binance.com/api/v3/klines"
 
-    def _fetch_binance_1h(self, asset: str, limit: int = 48) -> Optional[pd.DataFrame]:
+    # Max bars to keep in cache (4h bars) — ~3 years, enough for training + live
+    _CACHE_MAX_4H = 6500
+    _CACHE_MAX_1H = 26000  # 6500 × 4
+
+    def _fetch_binance_1h(self, asset: str, since: Optional[pd.Timestamp] = None) -> Optional[pd.DataFrame]:
         """
-        Fetch the latest `limit` closed 1h bars from Binance public REST API.
+        Fetch closed 1h bars from Binance public REST API.
+
+        If `since` is provided, fetches only bars newer than that timestamp
+        (gap-fill mode). Otherwise fetches the latest 48 bars.
         Drops the still-forming bar (last entry).
         """
         symbol = f"{asset}USDT"
+        params: dict = {"symbol": symbol, "interval": "1h"}
+
+        if since is not None:
+            # startTime = 1ms after last cached bar to avoid re-fetching it
+            params["startTime"] = int(since.timestamp() * 1000) + 1
+            params["limit"] = 1000   # max Binance allows
+        else:
+            params["limit"] = 49    # 48 closed + 1 forming
+
         try:
-            r = requests.get(
-                self._BINANCE_KLINES,
-                params={"symbol": symbol, "interval": "1h", "limit": limit + 1},
-                timeout=15,
-            )
+            r = requests.get(self._BINANCE_KLINES, params=params, timeout=15)
             if r.status_code != 200:
                 logger.warning("Binance klines %s HTTP %d", symbol, r.status_code)
                 return None
@@ -333,48 +345,78 @@ class PaperTrader:
             logger.warning("Binance fetch failed %s: %s", asset, exc)
             return None
 
+    @staticmethod
+    def _safe_write_parquet(df: pd.DataFrame, path: Path) -> None:
+        """Write parquet atomically via a temp file to avoid corruption on crash."""
+        tmp = path.with_suffix(".tmp")
+        df.to_parquet(tmp)
+        tmp.replace(path)   # atomic on Linux
+
     def _refresh_cache(self) -> None:
         """
-        Fetch the latest 1h bars from Binance public API for all assets and
-        merge them into the local parquet cache. Called at the start of each
-        cycle so the scanner always operates on up-to-date data.
+        Fetch only the gap (bars newer than last cached bar) from Binance public
+        API for all assets and merge into the local parquet cache.
+
+        - Fetches only missing bars (not a fixed 48 every time)
+        - Writes via temp file → atomic rename (crash-safe)
+        - Trims cache to _CACHE_MAX_4H / _CACHE_MAX_1H bars to prevent unbounded growth
         """
         logger.info("Refreshing cache from Binance public API ...")
         updated = 0
+
         for asset in TIER2_UNIVERSE:
-            df_new = self._fetch_binance_1h(asset, limit=48)
+            file_sym = "ASTER" if asset == "ASTR" else asset
+            path_1h  = CACHE_DIR / f"{file_sym}_USDT_1h.parquet"
+            path_4h  = CACHE_DIR / f"{file_sym}_USDT.parquet"
+
+            # Determine last cached 1h bar to fetch only the gap
+            since: Optional[pd.Timestamp] = None
+            old_1h: Optional[pd.DataFrame] = None
+            if path_1h.exists():
+                try:
+                    old_1h = pd.read_parquet(path_1h)
+                    old_1h.index = pd.to_datetime(old_1h.index, utc=True)
+                    since = old_1h.index[-1]
+                except Exception:
+                    old_1h = None
+
+            df_new = self._fetch_binance_1h(asset, since=since)
             if df_new is None or df_new.empty:
-                logger.debug("Cache refresh: no data for %s", asset)
+                logger.debug("Cache refresh: no new bars for %s", asset)
                 continue
 
-            file_sym = "ASTER" if asset == "ASTR" else asset
-
-            # ── Merge 1h ──────────────────────────────────────────────────────
-            path_1h = CACHE_DIR / f"{file_sym}_USDT_1h.parquet"
-            if path_1h.exists():
-                old_1h = pd.read_parquet(path_1h)
-                old_1h.index = pd.to_datetime(old_1h.index, utc=True)
+            # ── Merge & trim 1h ───────────────────────────────────────────────
+            if old_1h is not None:
                 df_1h = pd.concat([old_1h, df_new])
                 df_1h = df_1h[~df_1h.index.duplicated(keep="last")].sort_index()
             else:
                 df_1h = df_new
-            df_1h.to_parquet(path_1h)
+            if len(df_1h) > self._CACHE_MAX_1H:
+                df_1h = df_1h.iloc[-self._CACHE_MAX_1H:]
+            self._safe_write_parquet(df_1h, path_1h)
 
-            # ── Resample to 4h and merge ───────────────────────────────────────
+            # ── Resample new bars to 4h, merge & trim ─────────────────────────
             df_new_4h = df_new.resample("4h").agg(
                 {"open": "first", "high": "max", "low": "min",
                  "close": "last", "volume": "sum"}
             ).dropna(subset=["close"])
 
-            path_4h = CACHE_DIR / f"{file_sym}_USDT.parquet"
+            old_4h: Optional[pd.DataFrame] = None
             if path_4h.exists():
-                old_4h = pd.read_parquet(path_4h)
-                old_4h.index = pd.to_datetime(old_4h.index, utc=True)
+                try:
+                    old_4h = pd.read_parquet(path_4h)
+                    old_4h.index = pd.to_datetime(old_4h.index, utc=True)
+                except Exception:
+                    old_4h = None
+
+            if old_4h is not None:
                 df_4h = pd.concat([old_4h, df_new_4h])
                 df_4h = df_4h[~df_4h.index.duplicated(keep="last")].sort_index()
             else:
                 df_4h = df_new_4h
-            df_4h.to_parquet(path_4h)
+            if len(df_4h) > self._CACHE_MAX_4H:
+                df_4h = df_4h.iloc[-self._CACHE_MAX_4H:]
+            self._safe_write_parquet(df_4h, path_4h)
 
             updated += 1
             time.sleep(0.05)   # be polite to the public API
