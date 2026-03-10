@@ -299,6 +299,88 @@ class PaperTrader:
 
     # ── Live data fetching ────────────────────────────────────────────────────
 
+    _BINANCE_KLINES = "https://api.binance.com/api/v3/klines"
+
+    def _fetch_binance_1h(self, asset: str, limit: int = 48) -> Optional[pd.DataFrame]:
+        """
+        Fetch the latest `limit` closed 1h bars from Binance public REST API.
+        Drops the still-forming bar (last entry).
+        """
+        symbol = f"{asset}USDT"
+        try:
+            r = requests.get(
+                self._BINANCE_KLINES,
+                params={"symbol": symbol, "interval": "1h", "limit": limit + 1},
+                timeout=15,
+            )
+            if r.status_code != 200:
+                logger.warning("Binance klines %s HTTP %d", symbol, r.status_code)
+                return None
+            raw = r.json()
+            if not raw:
+                return None
+            df = pd.DataFrame(raw, columns=[
+                "open_time", "open", "high", "low", "close", "volume",
+                "close_time", "quote_vol", "trades", "tb_base", "tb_quote", "ignore",
+            ])
+            df["timestamp"] = pd.to_datetime(df["open_time"].astype(float), unit="ms", utc=True)
+            df = df.set_index("timestamp")[["open", "high", "low", "close", "volume"]].astype(float)
+            df = df.sort_index()
+            # Drop the last (still-forming) bar
+            df = df.iloc[:-1]
+            return df if not df.empty else None
+        except Exception as exc:
+            logger.warning("Binance fetch failed %s: %s", asset, exc)
+            return None
+
+    def _refresh_cache(self) -> None:
+        """
+        Fetch the latest 1h bars from Binance public API for all assets and
+        merge them into the local parquet cache. Called at the start of each
+        cycle so the scanner always operates on up-to-date data.
+        """
+        logger.info("Refreshing cache from Binance public API ...")
+        updated = 0
+        for asset in TIER2_UNIVERSE:
+            df_new = self._fetch_binance_1h(asset, limit=48)
+            if df_new is None or df_new.empty:
+                logger.debug("Cache refresh: no data for %s", asset)
+                continue
+
+            file_sym = "ASTER" if asset == "ASTR" else asset
+
+            # ── Merge 1h ──────────────────────────────────────────────────────
+            path_1h = CACHE_DIR / f"{file_sym}_USDT_1h.parquet"
+            if path_1h.exists():
+                old_1h = pd.read_parquet(path_1h)
+                old_1h.index = pd.to_datetime(old_1h.index, utc=True)
+                df_1h = pd.concat([old_1h, df_new])
+                df_1h = df_1h[~df_1h.index.duplicated(keep="last")].sort_index()
+            else:
+                df_1h = df_new
+            df_1h.to_parquet(path_1h)
+
+            # ── Resample to 4h and merge ───────────────────────────────────────
+            df_new_4h = df_new.resample("4h").agg(
+                {"open": "first", "high": "max", "low": "min",
+                 "close": "last", "volume": "sum"}
+            ).dropna(subset=["close"])
+
+            path_4h = CACHE_DIR / f"{file_sym}_USDT.parquet"
+            if path_4h.exists():
+                old_4h = pd.read_parquet(path_4h)
+                old_4h.index = pd.to_datetime(old_4h.index, utc=True)
+                df_4h = pd.concat([old_4h, df_new_4h])
+                df_4h = df_4h[~df_4h.index.duplicated(keep="last")].sort_index()
+            else:
+                df_4h = df_new_4h
+            df_4h.to_parquet(path_4h)
+
+            updated += 1
+            time.sleep(0.05)   # be polite to the public API
+
+        logger.info("Cache refresh done — %d/%d assets updated.", updated, len(TIER2_UNIVERSE))
+
     def _fetch_live(self, asset: str, tf: str, limit: int) -> Optional[pd.DataFrame]:
         """Fetch recent OHLCV bars from Binance (public API)."""
         symbol  = f"{asset}/USDT"
@@ -321,7 +403,7 @@ class PaperTrader:
             return None
 
     def _get_live_data(self, asset: str) -> tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
-        """Use local parquet cache as live data source (exchange network is blocked)."""
+        """Use local parquet cache as live data source."""
         df_4h = self._read_parquet(asset, "4h")
         df_1d = self._read_parquet(asset, "1d")
         # Trim to last LIVE_BARS_4H / LIVE_BARS_1D bars to match live behaviour
@@ -704,6 +786,7 @@ class PaperTrader:
         logger.info("═══ Paper cycle  %s  equity=$%.2f ═══",
                     now_str, self.state["equity"])
 
+        self._refresh_cache()
         closed = self.check_exits()
         halted = self._check_and_halt()
 
