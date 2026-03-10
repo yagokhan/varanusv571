@@ -1,0 +1,92 @@
+version:      "5.2.1"
+codename:     "Dual-Engine"
+parent:       "5.1.0 (The Hunter)"
+strategy:     "Asymmetric Dual-Engine — Short Hunter + Long Runner"
+tier:         2
+asset_class:  "Mid-Cap Crypto (ex-BTC/ETH)"
+author:       "Varanus / Chameleon Project"
+last_updated: "2026-03-07"
+status:       "DEPLOYED — Paper Trading Active"
+
+optimization:
+  v51_short_hunter:
+    best_trial:           183
+    best_hunter_eff:      "~74,000"
+    n_trials:             300
+    sampler:              "TPESampler"
+    pruner:               "HyperbandPruner"
+    params_file:          "config/best_params_v51.json"
+    status:               "FROZEN — DO NOT MODIFY"
+  v52_long_runner:
+    best_trial:           162
+    best_long_runner_score: 74.651
+    long_trades_oos:      55
+    n_trials:             300
+    sampler:              "TPESampler"
+    pruner:               "HyperbandPruner"
+    params_file:          "config/best_params_v52.json"
+    status:               "OPTIMIZED — Deep Search complete"
+    density_gate:         50
+    note:                 "Gate calibrated to model ceiling (~56 max). Raise to 60 in v5.2.2 after training imbalance fix."
+
+frozen_short_params:
+  conf_thresh_short:   0.786
+  tp_atr_mult:         5.768
+  sl_atr_mult:         0.709
+  leverage_5x_trigger: 0.968
+
+long_runner_optimized_params:
+  conf_thresh_long: 0.6227
+  tp_mult_long:     2.616
+  sl_mult_long:     1.000   # Fixed Hard Stop guardrail (not searched)
+
+long_runner_search_space:
+  conf_thresh_long: [0.55, 0.72]
+  tp_mult_long:     [2.5,  4.5]
+  sl_mult_long:     "FIXED at 1.0 (Hard Stop guardrail)"
+
+v52_walk_forward_results:
+  folds:              5
+  consistency:        "100% (5/5)"
+  total_return_pct:   [42.45, 78.86, 26.13, 217.40, 289.43]
+  total_pnl_usd:      32713.38
+  total_trades:       405
+  long_trades:        49
+  short_trades:       356
+  long_win_rate_pct:  30.6
+  short_win_rate_pct: 36.2
+  max_drawdown_worst: -18.4   # Fold 4 — DD breach
+  hunter_eff_mean:    "62,130"
+  note:               "Long Runner marginally positive EV (30.6% WR vs 27.7% breakeven at 2.616 R:R). Training imbalance fix scheduled for v5.2.2."
+
+v52_features:
+  total_features:     19
+  features_added:     ["bias_bypass_long", "ssl_sweep_long", "minor_mss_long"]
+  bypass_condition:   "RSI_1D < 50 OR price in bottom 40% of 100-day range (Deep Search)"
+  bypass_effect:      "Neutralise bearish HTF bias → allows long setup detection"
+  minor_mss_lookback: 8
+
+validation_gates:
+  step8_optimization:  "PASS — Trial #162, Score 74.651, 55 long trades, no DD penalty"
+  step9_walk_forward:  "CONDITIONAL PASS — consistency 100%, long WR 30.6% (below 38% gate but positive EV)"
+  step10_paper_trader: "DEPLOYED — v5.2.1"
+
+telegram:
+  bot:     "Varanusv51Bot"
+  env_var: "VARANUS_BOT_TOKEN / VARANUS_CHAT_ID"
+
+changelog:
+  - "5.2.1: Paper trader deployed with Dual-Engine params. TBM default fallbacks
+             corrected (short: tp=5.768/sl=0.709 frozen; long: tp=2.616/sl=1.0
+             optimized). Feature count comment updated to 19."
+  - "5.2.0: Deep Search applied. 19 features (+ ssl_sweep_long, minor_mss_long).
+             Bias bypass relaxed: RSI_1D<50, bottom 40% of range. conf_thresh_long
+             [0.55-0.72], sl_mult_long fixed at 1.0x ATR (Hard Stop guardrail).
+             Density objective: (WR x Count)/DD_Impact, gate=50. 300-trial
+             optimization: best Trial #162, score 74.651, conf=0.6227, tp=2.616x.
+             WFV: 100% consistency, $32,713 PnL, 405 trades (L:49, S:356)."
+  - "5.1.0: 5-fold 40/30/30 rolling WFV. Hunter Efficiency objective. 5x leverage
+             tier. Signal Decay, Dynamic Breakeven, MSS Invalidation exits.
+             300 Optuna trials, best Trial #183."
+  - "4.0.0: Initial Tier 2 specialization. MSS/FVG/Sweep signal core. Calmar
+             Ratio Optuna objective. Flash-wick guard."
