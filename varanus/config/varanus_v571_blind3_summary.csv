@@ -1,0 +1,2 @@
+period,total_trades,long_trades,short_trades,total_return_pct,net_profit_usd,win_rate_pct,long_win_rate_pct,short_win_rate_pct,profit_factor,expectancy_usd,avg_win_usd,avg_loss_usd,max_drawdown_pct,sharpe_ratio,exits_trailing_sl_hit,exits_sl
+Mar 01 2026 – Mar 09 2026,10,7,3,1.04,51.94,50.0,42.86,66.67,1.243,-0.16,53.21,-53.53,-3.29,1.819,7,3
