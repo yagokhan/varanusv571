@@ -486,6 +486,7 @@ class PaperTrader:
         open_trades       = self.state["open_trades"]
         conf_thresh_short = self.params.get("conf_thresh_short", self.params.get("confidence_thresh", 0.786))
         conf_thresh_long  = self.params.get("conf_thresh_long", 0.7728)
+        p_short_max       = self.params.get("p_short_max_for_long", 1.0)
         candidates: list[dict] = []
 
         # ── 1. Collect candidates ──────────────────────────────────────────────
@@ -502,22 +503,25 @@ class PaperTrader:
                 if X.empty:
                     continue
 
-                probs     = self.model.predict_proba(X)
-                preds     = self.model.predict(X)
-                direction = int(preds[-1])
+                probs = self.model.predict_proba(X)
+
+                # Direction assignment — mirrors blind test logic exactly:
+                #   Long:  p_long  >= conf_thresh_long  AND p_short <= p_short_max
+                #   Short: p_short >= conf_thresh_short AND p_short >= p_long
+                p_long_val  = float(probs[-1, 2])
+                p_short_val = float(probs[-1, 0])
+
+                direction  = 0
+                confidence = 0.0
+
+                if p_long_val >= conf_thresh_long and p_short_val <= p_short_max:
+                    direction  = 1
+                    confidence = p_long_val
+                if p_short_val >= conf_thresh_short and p_short_val >= p_long_val:
+                    direction  = -1      # short overrides long (same as blind test)
+                    confidence = p_short_val
 
                 if direction == 0:
-                    continue
-
-                # Direction-specific confidence gate
-                if direction == -1:
-                    confidence  = float(probs[-1, 0])   # p_short
-                    conf_thresh = conf_thresh_short
-                else:
-                    confidence  = float(probs[-1, 2])   # p_long
-                    conf_thresh = conf_thresh_long
-
-                if confidence < conf_thresh:
                     continue
 
                 latest_bar  = df_4h.iloc[-1]
