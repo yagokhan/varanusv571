@@ -29,7 +29,7 @@ import numpy as np
 import pandas as pd
 
 from varanus.universe import TIER2_UNIVERSE, HIGH_VOL_SUBTIER
-from varanus.pa_features import build_features, compute_atr
+from varanus.pa_features import build_features, compute_atr, detect_mss
 from varanus.tbm_labeler import label_trades, calculate_barriers, TBM_CONFIG, build_dual_labels
 from varanus.model import VaranusModel, VaranusDualModel, get_leverage, MODEL_CONFIG
 from varanus.risk import (
@@ -585,21 +585,23 @@ class PaperTrader:
             max_hold_ts = entry_ts + pd.Timedelta(hours=4 * self.params.get("max_holding", 30))
 
             trade = {
-                "asset":        asset,
-                "direction":    cand["direction"],
-                "confidence":   round(cand["confidence"], 4),
-                "leverage":     lev,
-                "entry_price":  round(cand["entry_price"], 6),
-                "take_profit":  round(cand["barriers"]["take_profit"], 6),
-                "stop_loss":    round(cand["barriers"]["stop_loss"], 6),
-                "rr_ratio":     cand["barriers"]["rr_ratio"],
-                "atr_14":       round(cand["atr"], 6),
-                "position_usd": round(pos_usd, 2),
-                "entry_ts":     entry_ts.isoformat(),
-                "max_hold_ts":  max_hold_ts.isoformat(),
-                "trail_active": False,
-                "trail_peak":   None,
-                "trail_stop":   None,
+                "asset":               asset,
+                "direction":           cand["direction"],
+                "confidence":          round(cand["confidence"], 4),
+                "entry_confidence":    round(cand["confidence"], 4),  # stored for signal decay check
+                "leverage":            lev,
+                "entry_price":         round(cand["entry_price"], 6),
+                "take_profit":         round(cand["barriers"]["take_profit"], 6),
+                "stop_loss":           round(cand["barriers"]["stop_loss"], 6),
+                "rr_ratio":            cand["barriers"]["rr_ratio"],
+                "atr_14":              round(cand["atr"], 6),
+                "position_usd":        round(pos_usd, 2),
+                "entry_ts":            entry_ts.isoformat(),
+                "max_hold_ts":         max_hold_ts.isoformat(),
+                "trail_active":        False,
+                "trail_peak":          None,
+                "trail_stop":          None,
+                "breakeven_activated": False,   # set True when dynamic BE fires
             }
 
             # ── 3. Send Telegram entry alert with position size ────────────────
@@ -655,72 +657,164 @@ class PaperTrader:
 
     # ── Exit checking ─────────────────────────────────────────────────────────
 
+    # Hunter active management constants — mirrors backtest.HUNTER_ACTIVE_CONFIG
+    _TRAIL_TRIGGER_PCT     = 0.01147   # Activate trailing stop after 1.147% profit
+    _TRAIL_DISTANCE_PCT    = 0.01147   # Trail at 1.147% below/above peak
+    _SIGNAL_DECAY_THRESH   = 0.35      # Exit if entry_confidence - current_confidence >= 0.35
+    _BREAKEVEN_TRIGGER_PCT = 0.75      # Move SL to entry when 75% of TP distance reached
+    _BREAKEVEN_BUFFER_ATR  = 0.05      # SL = entry +/- (0.05 × ATR) beyond entry
+
     def check_exits(self) -> list[dict]:
         """
-        For each open paper trade, fetch the latest 4h bars and check TP / SL / time.
-        Closes trades, updates equity, and sends Telegram exit alerts.
+        For each open paper trade, evaluate all exit conditions in priority order:
+
+          1. Trailing Stop        — 1.147% trigger / 1.147% distance from peak
+          2. MSS Invalidation     — exit at bar open if 4h MSS flips against position
+          3. Signal Decay         — exit if model confidence drops 0.35+ from entry
+          4. Dynamic Breakeven    — move SL to entry+buffer after 75% of TP reached
+          5. Standard Barriers    — TP (wick), SL (body close), Time (max_hold_ts)
+
+        Uses full 4h cache (no trimming) so MSS and features are computed on the
+        same historical context as the blind test — identical results guaranteed.
 
         Returns list of closed trade dicts.
         """
-        open_trades = self.state["open_trades"]
+        open_trades  = self.state["open_trades"]
         closed:      list[dict] = []
+        mss_lookback = self.params.get("mss_lookback", 40)
 
         for asset, trade in list(open_trades.items()):
-            df = self._read_parquet(asset, "4h")
-            if df is not None and len(df) > 10:
-                df = df.iloc[-10:]
+            # ── Load full data (no trimming — matches blind test feature context) ──
+            df    = self._read_parquet(asset, "4h")
+            df_1d = self._read_parquet(asset, "1d")
             if df is None or df.empty:
                 continue
 
-            entry_ts      = pd.Timestamp(trade["entry_ts"]).tz_localize("UTC") \
-                if pd.Timestamp(trade["entry_ts"]).tzinfo is None \
-                else pd.Timestamp(trade["entry_ts"])
+            entry_ts = pd.Timestamp(trade["entry_ts"])
+            if entry_ts.tzinfo is None:
+                entry_ts = entry_ts.tz_localize("UTC")
             bars_to_check = df[df.index > entry_ts]
+            if bars_to_check.empty:
+                # No new bars since entry — update trailing state and move on
+                open_trades[asset] = trade
+                continue
 
-            TRAIL_TRIGGER_PCT  = 0.01147
-            TRAIL_DISTANCE_PCT = 0.01147
+            # ── Precompute per-asset data for Hunter active management ──────────
 
+            # MSS series (full history → identical to blind test mss_cache)
+            mss_series = detect_mss(df, mss_lookback)
+
+            # Model probabilities per bar (for signal decay check)
+            proba_dir:   Optional[pd.Series] = None   # predicted direction per bar
+            proba_long:  Optional[pd.Series] = None   # p_long per bar
+            proba_short: Optional[pd.Series] = None   # p_short per bar
+            if self.model is not None and df_1d is not None:
+                try:
+                    X = build_features(df, df_1d, asset, self.params)
+                    if not X.empty:
+                        probs       = self.model.predict_proba(X)
+                        preds       = self.model.predict(X)
+                        proba_dir   = pd.Series(preds,       index=X.index, dtype=int)
+                        proba_long  = pd.Series(probs[:, 2], index=X.index)
+                        proba_short = pd.Series(probs[:, 0], index=X.index)
+                except Exception as exc:
+                    logger.debug("Signal decay data build failed %s: %s", asset, exc)
+
+            # ATR series (for dynamic breakeven buffer)
+            atr_series = compute_atr(df, 14)
+
+            # ── Bar-by-bar exit evaluation ──────────────────────────────────────
             outcome = None
             exit_ts = None
+
             for ts, bar in bars_to_check.iterrows():
                 d  = trade["direction"]
                 ep = trade["entry_price"]
 
-                # ── Trailing stop logic (v5.7.1) ──────────────────────────
+                # ── 1. Trailing Stop (highest priority) ────────────────────────
                 if d == 1:  # LONG
-                    if (bar["high"] - ep) / ep >= TRAIL_TRIGGER_PCT:
+                    if (bar["high"] - ep) / ep >= self._TRAIL_TRIGGER_PCT:
                         trade["trail_active"] = True
                     if trade.get("trail_active"):
                         peak = trade.get("trail_peak")
                         if peak is None or bar["high"] > peak:
                             trade["trail_peak"] = bar["high"]
-                            trade["trail_stop"] = bar["high"] * (1 - TRAIL_DISTANCE_PCT)
+                            trade["trail_stop"] = bar["high"] * (1 - self._TRAIL_DISTANCE_PCT)
                         if bar["close"] < trade["trail_stop"]:
                             outcome = {"type": "trailing_sl_hit", "price": trade["trail_stop"]}
                             exit_ts = ts
                             break
                 elif d == -1:  # SHORT
-                    if (ep - bar["low"]) / ep >= TRAIL_TRIGGER_PCT:
+                    if (ep - bar["low"]) / ep >= self._TRAIL_TRIGGER_PCT:
                         trade["trail_active"] = True
                     if trade.get("trail_active"):
                         peak = trade.get("trail_peak")
                         if peak is None or bar["low"] < peak:
                             trade["trail_peak"] = bar["low"]
-                            trade["trail_stop"] = bar["low"] * (1 + TRAIL_DISTANCE_PCT)
+                            trade["trail_stop"] = bar["low"] * (1 + self._TRAIL_DISTANCE_PCT)
                         if bar["close"] > trade["trail_stop"]:
                             outcome = {"type": "trailing_sl_hit", "price": trade["trail_stop"]}
                             exit_ts = ts
                             break
 
-                if outcome:
+                # ── 2. MSS Invalidation — structure flipped, thesis broken ──────
+                current_mss = int(mss_series.get(ts, 0))
+                if d == 1 and current_mss == -1:
+                    outcome = {"type": "mss_invalidation", "price": float(bar["open"])}
+                    exit_ts = ts
                     break
+                if d == -1 and current_mss == 1:
+                    outcome = {"type": "mss_invalidation", "price": float(bar["open"])}
+                    exit_ts = ts
+                    break
+
+                # ── 3. Signal Decay — model confidence collapsed since entry ─────
+                # Only triggers when a same-direction signal exists at this bar
+                # (mirrors backtest: ts in sig_df.index and direction matches)
+                if proba_dir is not None and ts in proba_dir.index:
+                    if int(proba_dir[ts]) == d:
+                        current_conf = (
+                            float(proba_long[ts])  if d ==  1 else
+                            float(proba_short[ts])
+                        )
+                        entry_conf = trade.get("entry_confidence", trade["confidence"])
+                        if entry_conf - current_conf >= self._SIGNAL_DECAY_THRESH:
+                            outcome = {"type": "signal_decay", "price": float(bar["open"])}
+                            exit_ts = ts
+                            break
+
+                # ── 4. Dynamic Breakeven — lock in floor after 75% of TP ────────
+                # Mutates trade["stop_loss"] in place — not an exit condition
+                current_atr = float(atr_series.get(ts, 0) or 0)
+                if current_atr > 0 and not trade.get("breakeven_activated"):
+                    buf = self._BREAKEVEN_BUFFER_ATR * current_atr
+                    if d == 1:
+                        target_dist = trade["take_profit"] - ep
+                        if bar["high"] >= ep + self._BREAKEVEN_TRIGGER_PCT * target_dist:
+                            new_sl = ep + buf
+                            if new_sl > trade["stop_loss"]:
+                                trade["stop_loss"]           = new_sl
+                                trade["breakeven_activated"] = True
+                                logger.info("BREAKEVEN  %-6s  new_sl=%.6f", asset, new_sl)
+                    elif d == -1:
+                        target_dist = ep - trade["take_profit"]
+                        if bar["low"] <= ep - self._BREAKEVEN_TRIGGER_PCT * target_dist:
+                            new_sl = ep - buf
+                            if new_sl < trade["stop_loss"]:
+                                trade["stop_loss"]           = new_sl
+                                trade["breakeven_activated"] = True
+                                logger.info("BREAKEVEN  %-6s  new_sl=%.6f", asset, new_sl)
+
+                # ── 5. Standard Barriers — TP / SL / Time ─────────────────────
                 outcome = _check_barriers(bar, trade)
                 if outcome:
                     exit_ts = ts
                     break
 
             if outcome is None:
-                continue   # Trade still open
+                # No exit triggered — persist updated trail/SL state
+                open_trades[asset] = trade
+                continue
 
             exit_price = outcome["price"]
 
