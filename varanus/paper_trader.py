@@ -724,6 +724,15 @@ class PaperTrader:
             atr_series = compute_atr(df, 14)
 
             # ── Bar-by-bar exit evaluation ──────────────────────────────────────
+            # Reset trailing-stop state before replaying all bars from entry.
+            # check_exits() replays every bar since entry_ts each cycle; if we
+            # kept persisted trail state from a previous cycle, later-bar state
+            # would leak into earlier bars and cause false exits.  Re-deriving
+            # from scratch mirrors the backtest (one bar at a time, in order).
+            trade["trail_active"] = False
+            trade["trail_peak"]   = None
+            trade["trail_stop"]   = None
+
             outcome = None
             exit_ts = None
 
