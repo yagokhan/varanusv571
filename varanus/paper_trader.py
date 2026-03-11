@@ -445,14 +445,19 @@ class PaperTrader:
             return None
 
     def _get_live_data(self, asset: str) -> tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
-        """Use local parquet cache as live data source."""
+        """
+        Return full cache for an asset — no trimming.
+
+        Using full history is critical for feature parity with the blind test.
+        RSI uses EWM (recursive), which needs thousands of warmup bars to
+        stabilise. Trimming to 400 bars causes rsi_14 / rsi_slope_3 to diverge
+        from blind-test values by up to ~42 bars, producing different signals.
+        bias_bypass_long also uses a 600-bar rolling window that 400 bars cannot
+        fully cover.  Full cache (≤6500 bars) is used so build_features()
+        produces identical feature vectors to the blind test.
+        """
         df_4h = self._read_parquet(asset, "4h")
         df_1d = self._read_parquet(asset, "1d")
-        # Trim to last LIVE_BARS_4H / LIVE_BARS_1D bars to match live behaviour
-        if df_4h is not None and len(df_4h) > LIVE_BARS_4H:
-            df_4h = df_4h.iloc[-LIVE_BARS_4H:]
-        if df_1d is not None and len(df_1d) > LIVE_BARS_1D:
-            df_1d = df_1d.iloc[-LIVE_BARS_1D:]
         return df_4h, df_1d
 
     # ── Signal scanning ───────────────────────────────────────────────────────
