@@ -38,7 +38,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from apscheduler.schedulers.blocking import BlockingScheduler
 
-_HERE = Path(__file__).parent
+_HERE   = Path(__file__).parent
+PID_FILE = _HERE / "logs" / "paper_trader.pid"
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 LOG_DIR = _HERE / "logs"
@@ -58,6 +59,40 @@ for _noisy in ("ccxt.base", "ccxt", "urllib3", "asyncio",
     logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 logger = logging.getLogger("run_paper")
+
+
+def _acquire_pid_lock() -> None:
+    """
+    Write current PID to PID_FILE. If a PID file already exists and that
+    process is still running, abort with an error — prevents duplicate instances.
+    Cleans up the PID file on exit via atexit.
+    """
+    import atexit
+
+    if PID_FILE.exists():
+        try:
+            existing_pid = int(PID_FILE.read_text().strip())
+            # Check if that process is actually alive
+            os.kill(existing_pid, 0)   # signal 0 = existence check only
+            print(
+                f"ERROR: Another instance is already running (PID {existing_pid}).\n"
+                f"       Stop it first, or delete {PID_FILE} if it is stale.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        except (ProcessLookupError, ValueError):
+            # Stale PID file — previous process is gone, safe to overwrite
+            pass
+
+    PID_FILE.write_text(str(os.getpid()))
+
+    def _remove_pid():
+        try:
+            PID_FILE.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    atexit.register(_remove_pid)
 
 
 def main() -> None:
@@ -110,6 +145,12 @@ def main() -> None:
         trader.reset_breaker()
         logger.info("Circuit breaker reset. Exiting.")
         return
+
+    # ── PID lock — prevent duplicate scheduler instances ─────────────────────
+    # Acquired before training so duplicate launches fail immediately (not after 60 s).
+    # --once, --status and --reset-breaker are exempt (single-shot, non-competing).
+    if not args.once:
+        _acquire_pid_lock()
 
     # ── Train model on historical cache ───────────────────────────────────────
     logger.info("Training model on historical data (this takes ~60 s) ...")
