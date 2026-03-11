@@ -13,7 +13,7 @@ from varanus.tbm_labeler import calculate_barriers, TBM_CONFIG
 from varanus.model import get_leverage_v51
 from varanus.universe import HIGH_VOL_SUBTIER
 from varanus.risk import is_correlated_to_open as _risk_is_correlated
-from varanus.pa_features import detect_mss
+from varanus.pa_features import detect_mss, compute_atr
 
 # ── v5.2 Short Hunter frozen params (Trial #183 — DO NOT MODIFY) ───────────────
 V52_SHORT_FROZEN_PARAMS = {
@@ -233,7 +233,7 @@ def run_backtest(
             current_mss = int(mss_cache.get(asset, pd.Series(dtype=int)).get(ts, 0))
 
             # Resolve current ATR for dynamic breakeven buffer
-            atr_series = data[asset]['high'].rolling(14).max() - data[asset]['low'].rolling(14).min()
+            atr_series = compute_atr(data[asset], 14)
             current_atr = float(atr_series.get(ts, 0) or 0)
 
             # ── Dynamic Trailing Stop — runs BEFORE hunter and standard barriers
