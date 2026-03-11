@@ -34,14 +34,14 @@ OUT_SUMMARY = _HERE / "varanus" / "config" / "varanus_v571_blind3_summary.csv"
 
 TRAIN_CUTOFF = pd.Timestamp("2025-11-01", tz="UTC")
 BLIND_START  = pd.Timestamp("2026-03-01", tz="UTC")
-BLIND_END    = pd.Timestamp("2026-03-09 23:59:59", tz="UTC")
+BLIND_END    = pd.Timestamp("2026-03-10 23:59:59", tz="UTC")
 
 # Daily file base URL (used because March 2026 monthly not yet published)
 DAILY_URL = "https://data.binance.vision/data/spot/daily/klines"
 COLS = ["open_time","open","high","low","close","volume",
         "close_time","quote_volume","trades","taker_buy_base","taker_buy_quote","ignore"]
 
-BLIND_DAYS = pd.date_range("2026-03-01", "2026-03-09", freq="D")
+BLIND_DAYS = pd.date_range("2026-03-01", "2026-03-10", freq="D")
 
 
 # ── Data helpers ──────────────────────────────────────────────────────────────
@@ -153,7 +153,7 @@ def run():
     print("=" * 65)
     print("  Varanus v5.7.1 — Blind Test 3")
     print(f"  Train : Jan 2023 – Oct 2025 (full optimization region)")
-    print(f"  Test  : Mar 01 2026 – Mar 09 2026 (never seen by optimizer)")
+    print(f"  Test  : Mar 01 2026 – Mar 10 2026 (never seen by optimizer)")
     print("  Dynamic Trailing Stop: TRAIL_TRIGGER=1.147% TRAIL_DIST=1.147%")
     print("=" * 65)
 
@@ -292,7 +292,7 @@ def run():
     by_outcome = trades["outcome"].value_counts().to_dict()
 
     summary = {
-        "period":             "Mar 01 2026 – Mar 09 2026",
+        "period":             "Mar 01 2026 – Mar 10 2026",
         "total_trades":       len(trades),
         "long_trades":        len(long_trades),
         "short_trades":       len(short_trades),
@@ -316,7 +316,7 @@ def run():
 
     print("\n" + "=" * 65)
     print("  BLIND TEST 3 RESULTS — v5.7.1")
-    print(f"  Period : Mar 01 2026 – Mar 09 2026 (9 days)")
+    print(f"  Period : Mar 01 2026 – Mar 10 2026 (10 days)")
     print("=" * 65)
     print(f"\n  Total Trades  : {len(trades)}  (L:{len(long_trades)}  S:{len(short_trades)})")
     print(f"  Overall WR    : {overall_wr:.1f}%")
