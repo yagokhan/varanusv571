@@ -179,10 +179,21 @@ class PaperTrader:
             "closed_trades":      [],
             "halted":             False,
             # Walk-forward maintenance monitor
-            "last_training_date":  datetime.now(timezone.utc).date().isoformat(),
+            "last_training_date":  self._BASELINE_TRAINING_DATE,
             "peak_equity_date":    datetime.now(timezone.utc).date().isoformat(),
             "maintenance_required": False,
             "performance_drift":   False,
+            # 8-fold sliding window registry (original WFV folds)
+            "fold_registry": [
+                {"fold": 1, "start": "2023-01-01", "end": "2023-05-13"},
+                {"fold": 2, "start": "2023-05-14", "end": "2023-09-23"},
+                {"fold": 3, "start": "2023-09-24", "end": "2024-02-04"},
+                {"fold": 4, "start": "2024-02-05", "end": "2024-06-17"},
+                {"fold": 5, "start": "2024-06-18", "end": "2024-10-28"},
+                {"fold": 6, "start": "2024-10-29", "end": "2025-03-11"},
+                {"fold": 7, "start": "2025-03-12", "end": "2025-07-22"},
+                {"fold": 8, "start": "2025-07-23", "end": "2025-10-31"},
+            ],
         }
         self._write_state(default)
         return default
@@ -682,6 +693,8 @@ class PaperTrader:
     # Adaptive walk-forward maintenance monitor constants
     _RETRAIN_CYCLE_DAYS    = 120       # Rule A: max days before retraining required
     _ATH_STAGNATION_DAYS   = 30        # Rule B: max days without new equity ATH
+    _FOLD_DEPTH            = 8         # Number of folds in the sliding window
+    _BASELINE_TRAINING_DATE = "2026-02-28"  # End of original Fold 8
 
     def check_exits(self) -> list[dict]:
         """
@@ -940,78 +953,216 @@ class PaperTrader:
 
     # ── Walk-Forward Maintenance Monitor ───────────────────────────────────────
 
-    def check_model_integrity(self) -> dict:
+    def _ensure_maintenance_state(self) -> None:
+        """Ensure all maintenance-related state fields exist (backward compat)."""
+        defaults = {
+            "last_training_date":   self._BASELINE_TRAINING_DATE,
+            "peak_equity_date":     datetime.now(timezone.utc).date().isoformat(),
+            "maintenance_required": False,
+            "performance_drift":    False,
+            "fold_registry": [
+                {"fold": 1, "start": "2023-01-01", "end": "2023-05-13"},
+                {"fold": 2, "start": "2023-05-14", "end": "2023-09-23"},
+                {"fold": 3, "start": "2023-09-24", "end": "2024-02-04"},
+                {"fold": 4, "start": "2024-02-05", "end": "2024-06-17"},
+                {"fold": 5, "start": "2024-06-18", "end": "2024-10-28"},
+                {"fold": 6, "start": "2024-10-29", "end": "2025-03-11"},
+                {"fold": 7, "start": "2025-03-12", "end": "2025-07-22"},
+                {"fold": 8, "start": "2025-07-23", "end": "2025-10-31"},
+            ],
+        }
+        for key, val in defaults.items():
+            if key not in self.state:
+                self.state[key] = val
+
+    def _backfill_missing_data(self) -> int:
         """
-        Adaptive walk-forward maintenance monitor. Runs every 4h bar close.
+        Backfill any missing 4h OHLCV data between the last cached bar and now.
 
-        Rule A — Fixed Sliding Window (120-Day Cycle):
-            If time since last_training_date > 120 days → MAINTENANCE_REQUIRED.
-            The oldest data fold must be dropped and the latest 120 days of
-            live market data formatted as the new test fold (10-fold sliding
-            window).
+        Uses the existing _refresh_cache() gap-fill logic which fetches only
+        bars newer than the last cached timestamp from Binance public API.
+        Returns the number of assets updated.
+        """
+        logger.info("Backfilling missing market data since last session ...")
+        updated = 0
 
-        Rule B — Dynamic Stagnation Check (30-Day Performance Drift):
-            If equity has not reached a new ATH for 30 consecutive days →
-            PERFORMANCE_DRIFT_ALERT.  Acts as an emergency circuit breaker
-            to re-evaluate the model's alignment with current market volatility.
+        for asset in TIER2_UNIVERSE:
+            file_sym = "ASTER" if asset == "ASTR" else asset
+            path_1h  = CACHE_DIR / f"{file_sym}_USDT_1h.parquet"
 
-        Returns dict with keys: maintenance_required, performance_drift,
-                                days_since_training, days_since_ath.
+            # Determine gap size
+            since = None
+            if path_1h.exists():
+                try:
+                    old = pd.read_parquet(path_1h)
+                    old.index = pd.to_datetime(old.index, utc=True)
+                    since = old.index[-1]
+                    gap_hours = (pd.Timestamp.now(tz="UTC") - since).total_seconds() / 3600
+                    if gap_hours < 2:
+                        continue  # Already up to date
+                    logger.debug("Backfill %s: gap=%.0fh since %s", asset, gap_hours, since)
+                except Exception:
+                    pass
+
+            df_new = self._fetch_binance_1h(asset, since=since)
+            if df_new is not None and not df_new.empty:
+                # Merge 1h
+                if since is not None:
+                    old = pd.read_parquet(path_1h)
+                    old.index = pd.to_datetime(old.index, utc=True)
+                    df_1h = pd.concat([old, df_new])
+                    df_1h = df_1h[~df_1h.index.duplicated(keep="last")].sort_index()
+                else:
+                    df_1h = df_new
+                if len(df_1h) > self._CACHE_MAX_1H:
+                    df_1h = df_1h.iloc[-self._CACHE_MAX_1H:]
+                self._safe_write_parquet(df_1h, path_1h)
+
+                # Resample to 4h and merge
+                path_4h = CACHE_DIR / f"{file_sym}_USDT.parquet"
+                df_new_4h = df_new.resample("4h").agg(
+                    {"open": "first", "high": "max", "low": "min",
+                     "close": "last", "volume": "sum"}
+                ).dropna(subset=["close"])
+                if path_4h.exists():
+                    old4 = pd.read_parquet(path_4h)
+                    old4.index = pd.to_datetime(old4.index, utc=True)
+                    df_4h = pd.concat([old4, df_new_4h])
+                    df_4h = df_4h[~df_4h.index.duplicated(keep="last")].sort_index()
+                else:
+                    df_4h = df_new_4h
+                if len(df_4h) > self._CACHE_MAX_4H:
+                    df_4h = df_4h.iloc[-self._CACHE_MAX_4H:]
+                self._safe_write_parquet(df_4h, path_4h)
+                updated += 1
+            time.sleep(0.05)
+
+        logger.info("Backfill complete — %d/%d assets updated.", updated, len(TIER2_UNIVERSE))
+        return updated
+
+    def _rotate_fold_window(self) -> dict:
+        """
+        Execute the 8-fold sliding window rotation:
+          1. Drop Fold 1 (oldest ~133-day block)
+          2. Shift Folds 2-8 → Folds 1-7
+          3. Append the new 120-day block as the latest Fold 8
+
+        Returns the new fold that was created.
+        """
+        from datetime import date, timedelta
+
+        registry = self.state["fold_registry"]
+        last_fold_end = date.fromisoformat(registry[-1]["end"])
+        new_fold_start = last_fold_end + timedelta(days=1)
+        new_fold_end = new_fold_start + timedelta(days=self._RETRAIN_CYCLE_DAYS - 1)
+
+        # Drop oldest, shift remaining, append new
+        dropped = registry.pop(0)
+        for i, fold in enumerate(registry):
+            fold["fold"] = i + 1
+        new_fold = {
+            "fold":  self._FOLD_DEPTH,
+            "start": new_fold_start.isoformat(),
+            "end":   new_fold_end.isoformat(),
+        }
+        registry.append(new_fold)
+
+        logger.info(
+            "FOLD ROTATION | Dropped Fold 1 (%s → %s) | "
+            "New Fold %d (%s → %s)",
+            dropped["start"], dropped["end"],
+            self._FOLD_DEPTH, new_fold["start"], new_fold["end"],
+        )
+
+        self.state["fold_registry"] = registry
+        return new_fold
+
+    def maintenance_check(self) -> dict:
+        """
+        Automated 8-fold walk-forward maintenance monitor.
+        Runs on bot startup and at every 4h bar close.
+
+        Baselines from February 28, 2026 (end of original Fold 8).
+        Tracks "Global Market Time" relative to this date regardless of
+        bot uptime/downtime.
+
+        Rule A — Automated 120-Day Maintenance & Backfill:
+            Every 120 days from last_training_date:
+            1. Backfill any missing data for the downtime period
+            2. Drop Fold 1 (oldest ~133-day block)
+            3. Append the new 120-day block as latest Fold 8
+            4. Re-index all folds to maintain 8-fold depth
+            5. Flag MAINTENANCE_REQUIRED for Champion-Challenger retrain
+
+        Rule B — 30-Day Stagnation Circuit Breaker:
+            If equity fails to reach a new ATH for 30 consecutive days,
+            trigger PERFORMANCE_DRIFT_ALERT regardless of the 120-day timer.
+
+        Returns dict with maintenance status and fold info.
         """
         from datetime import date
 
         today = datetime.now(timezone.utc).date()
-
-        # ── Ensure state fields exist (backward compat with old state files) ──
-        if "last_training_date" not in self.state:
-            self.state["last_training_date"] = today.isoformat()
-        if "peak_equity_date" not in self.state:
-            self.state["peak_equity_date"] = today.isoformat()
-        if "maintenance_required" not in self.state:
-            self.state["maintenance_required"] = False
-        if "performance_drift" not in self.state:
-            self.state["performance_drift"] = False
+        self._ensure_maintenance_state()
 
         # ── Update peak equity date tracking ──────────────────────────────────
         current_equity = self.state["equity"]
         peak_equity    = self.state.get("peak_equity", current_equity)
 
         if current_equity >= peak_equity:
-            # New ATH — reset the stagnation counter
-            self.state["peak_equity"]      = current_equity
-            self.state["peak_equity_date"] = today.isoformat()
+            self.state["peak_equity"]       = current_equity
+            self.state["peak_equity_date"]  = today.isoformat()
             self.state["performance_drift"] = False
 
-        # ── Rule A: 120-day retraining cycle ──────────────────────────────────
+        # ── Rule A: 120-day retraining cycle with backfill ────────────────────
         last_train = date.fromisoformat(self.state["last_training_date"])
         days_since_training = (today - last_train).days
         maintenance_needed = days_since_training >= self._RETRAIN_CYCLE_DAYS
 
-        # ── Rule B: 30-day ATH stagnation ─────────────────────────────────────
-        peak_date = date.fromisoformat(self.state["peak_equity_date"])
-        days_since_ath = (today - peak_date).days
-        drift_detected = days_since_ath >= self._ATH_STAGNATION_DAYS
-
-        # ── Fire alerts (only on state transition to avoid spamming) ──────────
+        new_fold = None
         if maintenance_needed and not self.state["maintenance_required"]:
             self.state["maintenance_required"] = True
+
+            # Step 1: Backfill missing data for any downtime period
+            backfilled = self._backfill_missing_data()
+
+            # Step 2: Rotate the 8-fold sliding window
+            new_fold = self._rotate_fold_window()
+
             logger.critical(
                 "MAINTENANCE_REQUIRED | %d days since last training "
-                "(limit: %d). Prepare v5.7.2 candidate model.",
+                "(limit: %d). Backfilled %d assets. "
+                "New Fold 8: %s → %s. Prepare v5.7.2 candidate model.",
                 days_since_training, self._RETRAIN_CYCLE_DAYS,
+                backfilled, new_fold["start"], new_fold["end"],
+            )
+
+            # Build fold summary for alert
+            registry = self.state["fold_registry"]
+            fold_lines = "\n".join(
+                f"  Fold {f['fold']}: {f['start']} → {f['end']}"
+                for f in registry
             )
             send_maintenance_alert(
-                trigger="Time-Based (120-Day Cycle)",
+                trigger="120-Day Cycle — Automated Backfill & Fold Rotation",
                 details=(
                     f"Days since last training: {days_since_training}\n"
                     f"Last trained: {last_train.isoformat()}\n"
-                    f"Protocol: Drop oldest fold, add latest 120 days as "
-                    f"new test fold, retrain with Champion-Challenger verification."
+                    f"Backfilled assets: {backfilled}/{len(TIER2_UNIVERSE)}\n"
+                    f"New Fold 8: {new_fold['start']} → {new_fold['end']}\n"
+                    f"\nUpdated 8-Fold Window:\n{fold_lines}\n"
+                    f"\nAction Required: Retrain model on updated folds "
+                    f"with Champion-Challenger verification."
                 ),
                 bot_token=self._bot_token,
                 chat_id=self._chat_id,
                 dry_run=self.dry_run,
             )
+
+        # ── Rule B: 30-day ATH stagnation ─────────────────────────────────────
+        peak_date = date.fromisoformat(self.state["peak_equity_date"])
+        days_since_ath = (today - peak_date).days
+        drift_detected = days_since_ath >= self._ATH_STAGNATION_DAYS
 
         if drift_detected and not self.state["performance_drift"]:
             self.state["performance_drift"] = True
@@ -1027,8 +1178,9 @@ class PaperTrader:
                     f"Days since last ATH: {days_since_ath}\n"
                     f"Current equity: ${current_equity:,.2f}\n"
                     f"Peak equity: ${peak_equity:,.2f}\n"
-                    f"Protocol: Emergency model re-evaluation. Check alignment "
-                    f"with current market volatility regime."
+                    f"Protocol: Emergency model re-evaluation — bypasses "
+                    f"120-day timer. Check alignment with current market "
+                    f"volatility regime."
                 ),
                 bot_token=self._bot_token,
                 chat_id=self._chat_id,
@@ -1042,14 +1194,17 @@ class PaperTrader:
             "performance_drift":    drift_detected,
             "days_since_training":  days_since_training,
             "days_since_ath":       days_since_ath,
+            "fold_registry":        self.state["fold_registry"],
+            "new_fold":             new_fold,
         }
 
         if maintenance_needed or drift_detected:
             logger.info(
                 "Model integrity | maintenance=%s  drift=%s  "
-                "train_age=%dd  ath_age=%dd",
+                "train_age=%dd  ath_age=%dd  folds=%d",
                 maintenance_needed, drift_detected,
                 days_since_training, days_since_ath,
+                len(self.state["fold_registry"]),
             )
 
         return result
@@ -1075,7 +1230,7 @@ class PaperTrader:
         self._refresh_cache()
         closed = self.check_exits()
         halted = self._check_and_halt()
-        integrity = self.check_model_integrity()
+        integrity = self.maintenance_check()
 
         if halted:
             logger.info("Scan skipped (halted).")
@@ -1195,19 +1350,25 @@ class PaperTrader:
         # Walk-forward maintenance monitor status
         from datetime import date as _date
         _today = datetime.now(timezone.utc).date()
-        _last_train = self.state.get("last_training_date", _today.isoformat())
+        _last_train = self.state.get("last_training_date",
+                                     self._BASELINE_TRAINING_DATE)
         _train_age = (_today - _date.fromisoformat(_last_train)).days
         _peak_dt = self.state.get("peak_equity_date", _today.isoformat())
         _ath_age = (_today - _date.fromisoformat(_peak_dt)).days
         _maint = self.state.get("maintenance_required", False)
         _drift = self.state.get("performance_drift", False)
+        _folds = self.state.get("fold_registry", [])
         print(f"\n  ── Model Integrity ──")
+        print(f"  Baseline:      {self._BASELINE_TRAINING_DATE} (Fold 8 end)")
         print(f"  Last trained:  {_last_train}  ({_train_age}d ago, "
               f"limit {self._RETRAIN_CYCLE_DAYS}d)")
         print(f"  Last ATH:      {_peak_dt}  ({_ath_age}d ago, "
               f"limit {self._ATH_STAGNATION_DAYS}d)")
+        if _folds:
+            print(f"  Fold window:   {_folds[0]['start']} → "
+                  f"{_folds[-1]['end']}  ({len(_folds)} folds)")
         if _maint:
-            print(f"  ⚠ MAINTENANCE_REQUIRED — retrain with walk-forward update")
+            print(f"  ⚠ MAINTENANCE_REQUIRED — retrain with 8-fold update")
         if _drift:
             print(f"  ⚠ PERFORMANCE_DRIFT — no new ATH for {_ath_age} days")
 

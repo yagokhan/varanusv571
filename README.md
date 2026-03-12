@@ -443,31 +443,62 @@ Both blind tests use data the optimizer and backtest engine **never saw**. One f
 
 ---
 
-## 13. Adaptive Walk-Forward Maintenance Monitor
+## 13. Self-Healing Sliding Window — Automated Walk-Forward Maintenance
 
-The system includes an automated model integrity monitor (`check_model_integrity()`) that runs at every 4-hour bar close as part of the standard `run_cycle()` lifecycle. It enforces two maintenance rules and defines a Champion-Challenger verification process for model updates.
+The system includes an automated **Self-Healing Sliding Window** maintenance engine (`maintenance_check()`) that runs on bot startup and at every 4-hour bar close. It enforces two maintenance rules, automatically backfills missing data, rotates the 8-fold structure, and defines a Champion-Challenger verification process for model updates.
 
-### Rule A — Fixed Sliding Window (120-Day Retraining Cycle)
+### Reference Baseline
 
-The system tracks `last_training_date` in persistent state. When the elapsed time exceeds **120 days**, a `MAINTENANCE_REQUIRED` flag is set and a critical Telegram alert is sent.
+The system baselines from **February 28, 2026** — the end of the original Fold 8 training window. All maintenance timers track "Global Market Time" relative to this date, regardless of bot uptime/downtime.
 
-**Retraining protocol:**
-1. Drop the oldest data fold from the 10-fold sliding window
-2. Format the latest 120 days of live market data as the new "Test Fold"
-3. Retrain the model on the updated fold structure
-4. Validate via the Champion-Challenger process (see below)
+**Initial 8-Fold Registry:**
 
-This ensures the model's training window evolves with market conditions and prevents stale parameter sets from persisting indefinitely.
+| Fold | Start | End |
+|------|-------|-----|
+| 1 | 2023-01-01 | 2023-05-13 |
+| 2 | 2023-05-14 | 2023-09-23 |
+| 3 | 2023-09-24 | 2024-02-04 |
+| 4 | 2024-02-05 | 2024-06-17 |
+| 5 | 2024-06-18 | 2024-10-28 |
+| 6 | 2024-10-29 | 2025-03-11 |
+| 7 | 2025-03-12 | 2025-07-22 |
+| 8 | 2025-07-23 | 2025-10-31 |
 
-### Rule B — Dynamic Stagnation Check (30-Day Performance Drift)
+The fold registry is persisted in `paper_state.json` and updated automatically on each rotation.
 
-The system continuously monitors the equity curve. If the portfolio fails to reach a new **Equity All-Time High (ATH)** for **30 consecutive days**, a `PERFORMANCE_DRIFT_ALERT` is triggered.
+### Rule A — Automated 120-Day Maintenance & Backfill
 
-This acts as an emergency circuit breaker to re-evaluate the model's alignment with current market volatility. Unlike the daily loss / drawdown circuit breaker (which halts trading), the performance drift alert signals that the model itself may need retraining — not just a pause.
+Every 120 days from `last_training_date`, the system executes a mandatory maintenance cycle:
+
+**Step 1 — Backfill Missing Data:**
+If the bot was offline during the 120-day window, it automatically downloads missing 4h OHLCV data from the Binance public API for all 15 Tier-2 assets. The gap-fill logic fetches only bars newer than the last cached timestamp — no redundant downloads.
+
+**Step 2 — Rotate the 8-Fold Sliding Window:**
+```
+Before rotation:                    After rotation:
+  Fold 1: 2023-01-01 → 2023-05-13    [DROPPED]
+  Fold 2: 2023-05-14 → 2023-09-23    Fold 1: 2023-05-14 → 2023-09-23
+  Fold 3: 2023-09-24 → 2024-02-04    Fold 2: 2023-09-24 → 2024-02-04
+  ...                                ...
+  Fold 8: 2025-07-23 → 2025-10-31    Fold 7: 2025-07-23 → 2025-10-31
+                                      Fold 8: 2025-11-01 → 2026-02-28  [NEW]
+```
+
+**Step 3 — Alert & Flag:**
+A `MAINTENANCE_REQUIRED` flag is set, a critical log entry is written, and a Telegram alert is sent with the full updated fold structure. The alert message reads:
+> "Action Required: 120 days of market data accumulated since last fold. Backfilling missing data and preparing 8-fold update."
+
+**Step 4 — Champion-Challenger Retrain** (see below).
+
+### Rule B — 30-Day Stagnation Circuit Breaker
+
+The system continuously monitors the live equity curve. If the portfolio fails to reach a new **Equity All-Time High (ATH)** for **30 consecutive days**, a `PERFORMANCE_DRIFT_ALERT` is triggered immediately.
+
+This **bypasses the 120-day timer** and signals an urgent model refresh. Unlike the daily loss / drawdown circuit breaker (which halts trading), the performance drift alert signals that the model itself may have lost alignment with current market volatility — not just a bad streak.
 
 **State tracking:**
-- `peak_equity_date` — date of the most recent equity ATH
-- `performance_drift` — boolean flag, reset when a new ATH is reached
+- `peak_equity_date` — date of the most recent equity ATH (reset on new highs)
+- `performance_drift` — boolean flag, auto-reset when a new ATH is reached
 
 ### Champion-Challenger Verification Process
 
@@ -475,13 +506,24 @@ Before any newly trained model replaces the live production model, the following
 
 | Step | Description | Pass Criteria |
 |------|-------------|---------------|
-| 1. Train Challenger | Retrain on updated fold structure with latest data | Model converges, no errors |
+| 1. Train Challenger | Retrain on updated 8-fold structure with rotated data | Model converges, no errors |
 | 2. Blind Backtest | Run challenger on the most recent 30–60 days of data it has never seen | Positive PnL, WR >= 41% for longs |
 | 3. Side-by-Side | Run both champion and challenger in parallel (paper mode) for >= 2 full 4h cycles | Challenger signals are comparable or better |
 | 4. Metric Gate | Compare Sharpe, Profit Factor, Max DD, Win Rate | Challenger must not degrade any metric by > 10% |
 | 5. Promote | If all gates pass, replace champion with challenger and update `last_training_date` | Manual approval required |
 
 The champion (current live model) continues trading during the entire verification process. The challenger never touches live equity until promoted.
+
+### Implementation Details
+
+| Component | Location |
+|-----------|----------|
+| `maintenance_check()` | `varanus/paper_trader.py` — main entry point, runs every 4h |
+| `_backfill_missing_data()` | `varanus/paper_trader.py` — automated Binance API gap-fill |
+| `_rotate_fold_window()` | `varanus/paper_trader.py` — drop/shift/append fold rotation |
+| `_ensure_maintenance_state()` | `varanus/paper_trader.py` — backward compat state migration |
+| `send_maintenance_alert()` | `varanus/alerts.py` — Telegram notification |
+| Fold registry | `varanus/config/paper_state.json` — persistent fold date tracking |
 
 ---
 
