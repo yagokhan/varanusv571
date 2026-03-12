@@ -227,6 +227,25 @@ def send_heartbeat_alert(state: dict, health: dict,
     _post("\n".join(lines), bot_token, chat_id)
 
 
+MAINTENANCE_FORMAT = (
+    "🔧 *VARANUS v5.7.1 — MODEL MAINTENANCE REQUIRED*\n"
+    "Trigger: {trigger}\n"
+    "{details}\n"
+    "Action: Prepare v5.7.2 candidate model."
+)
+
+
+def send_maintenance_alert(trigger: str, details: str,
+                           bot_token: str, chat_id: str,
+                           dry_run: bool = False) -> None:
+    """Send a model maintenance / performance drift alert."""
+    msg = MAINTENANCE_FORMAT.format(trigger=trigger, details=details)
+    if dry_run:
+        print(f"[dry-run] Maintenance alert:\n{msg}\n")
+        return
+    _post(msg, bot_token, chat_id)
+
+
 def send_halt_alert(health: dict, bot_token: str, chat_id: str,
                     dry_run: bool = False) -> None:
     """

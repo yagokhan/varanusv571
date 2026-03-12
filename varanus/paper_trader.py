@@ -39,7 +39,8 @@ from varanus.risk import (
     compute_portfolio_leverage,
 )
 from varanus.alerts import (send_alert, send_exit_alert, send_halt_alert,
-                            send_no_signal_alert, send_heartbeat_alert)
+                            send_no_signal_alert, send_heartbeat_alert,
+                            send_maintenance_alert)
 
 logger = logging.getLogger(__name__)
 
@@ -177,6 +178,11 @@ class PaperTrader:
             "open_trades":        {},   # {asset: trade_dict}
             "closed_trades":      [],
             "halted":             False,
+            # Walk-forward maintenance monitor
+            "last_training_date":  datetime.now(timezone.utc).date().isoformat(),
+            "peak_equity_date":    datetime.now(timezone.utc).date().isoformat(),
+            "maintenance_required": False,
+            "performance_drift":   False,
         }
         self._write_state(default)
         return default
@@ -247,6 +253,11 @@ class PaperTrader:
 
         self.model = VaranusDualModel(MODEL_CONFIG)
         self.model.fit(X_tr, y_tr, X_val, y_val, y_short_tr, y_short_val)
+
+        # Record training date for walk-forward maintenance monitor
+        self.state["last_training_date"] = datetime.now(timezone.utc).date().isoformat()
+        self.state["maintenance_required"] = False
+        self._write_state()
 
         logger.info(
             "Model trained | train=%d  val=%d  assets=%d",
@@ -668,6 +679,10 @@ class PaperTrader:
     _BREAKEVEN_TRIGGER_PCT = 0.75      # Move SL to entry when 75% of TP distance reached
     _BREAKEVEN_BUFFER_ATR  = 0.05      # SL = entry +/- (0.05 × ATR) beyond entry
 
+    # Adaptive walk-forward maintenance monitor constants
+    _RETRAIN_CYCLE_DAYS    = 120       # Rule A: max days before retraining required
+    _ATH_STAGNATION_DAYS   = 30        # Rule B: max days without new equity ATH
+
     def check_exits(self) -> list[dict]:
         """
         For each open paper trade, evaluate all exit conditions in priority order:
@@ -923,6 +938,122 @@ class PaperTrader:
         self._write_state()
         logger.info("Circuit breaker reset.")
 
+    # ── Walk-Forward Maintenance Monitor ───────────────────────────────────────
+
+    def check_model_integrity(self) -> dict:
+        """
+        Adaptive walk-forward maintenance monitor. Runs every 4h bar close.
+
+        Rule A — Fixed Sliding Window (120-Day Cycle):
+            If time since last_training_date > 120 days → MAINTENANCE_REQUIRED.
+            The oldest data fold must be dropped and the latest 120 days of
+            live market data formatted as the new test fold (10-fold sliding
+            window).
+
+        Rule B — Dynamic Stagnation Check (30-Day Performance Drift):
+            If equity has not reached a new ATH for 30 consecutive days →
+            PERFORMANCE_DRIFT_ALERT.  Acts as an emergency circuit breaker
+            to re-evaluate the model's alignment with current market volatility.
+
+        Returns dict with keys: maintenance_required, performance_drift,
+                                days_since_training, days_since_ath.
+        """
+        from datetime import date
+
+        today = datetime.now(timezone.utc).date()
+
+        # ── Ensure state fields exist (backward compat with old state files) ──
+        if "last_training_date" not in self.state:
+            self.state["last_training_date"] = today.isoformat()
+        if "peak_equity_date" not in self.state:
+            self.state["peak_equity_date"] = today.isoformat()
+        if "maintenance_required" not in self.state:
+            self.state["maintenance_required"] = False
+        if "performance_drift" not in self.state:
+            self.state["performance_drift"] = False
+
+        # ── Update peak equity date tracking ──────────────────────────────────
+        current_equity = self.state["equity"]
+        peak_equity    = self.state.get("peak_equity", current_equity)
+
+        if current_equity >= peak_equity:
+            # New ATH — reset the stagnation counter
+            self.state["peak_equity"]      = current_equity
+            self.state["peak_equity_date"] = today.isoformat()
+            self.state["performance_drift"] = False
+
+        # ── Rule A: 120-day retraining cycle ──────────────────────────────────
+        last_train = date.fromisoformat(self.state["last_training_date"])
+        days_since_training = (today - last_train).days
+        maintenance_needed = days_since_training >= self._RETRAIN_CYCLE_DAYS
+
+        # ── Rule B: 30-day ATH stagnation ─────────────────────────────────────
+        peak_date = date.fromisoformat(self.state["peak_equity_date"])
+        days_since_ath = (today - peak_date).days
+        drift_detected = days_since_ath >= self._ATH_STAGNATION_DAYS
+
+        # ── Fire alerts (only on state transition to avoid spamming) ──────────
+        if maintenance_needed and not self.state["maintenance_required"]:
+            self.state["maintenance_required"] = True
+            logger.critical(
+                "MAINTENANCE_REQUIRED | %d days since last training "
+                "(limit: %d). Prepare v5.7.2 candidate model.",
+                days_since_training, self._RETRAIN_CYCLE_DAYS,
+            )
+            send_maintenance_alert(
+                trigger="Time-Based (120-Day Cycle)",
+                details=(
+                    f"Days since last training: {days_since_training}\n"
+                    f"Last trained: {last_train.isoformat()}\n"
+                    f"Protocol: Drop oldest fold, add latest 120 days as "
+                    f"new test fold, retrain with Champion-Challenger verification."
+                ),
+                bot_token=self._bot_token,
+                chat_id=self._chat_id,
+                dry_run=self.dry_run,
+            )
+
+        if drift_detected and not self.state["performance_drift"]:
+            self.state["performance_drift"] = True
+            logger.critical(
+                "PERFORMANCE_DRIFT_ALERT | No new equity ATH for %d days "
+                "(limit: %d). Current equity=$%.2f  Peak=$%.2f",
+                days_since_ath, self._ATH_STAGNATION_DAYS,
+                current_equity, peak_equity,
+            )
+            send_maintenance_alert(
+                trigger="Performance Drift (30-Day Stagnation)",
+                details=(
+                    f"Days since last ATH: {days_since_ath}\n"
+                    f"Current equity: ${current_equity:,.2f}\n"
+                    f"Peak equity: ${peak_equity:,.2f}\n"
+                    f"Protocol: Emergency model re-evaluation. Check alignment "
+                    f"with current market volatility regime."
+                ),
+                bot_token=self._bot_token,
+                chat_id=self._chat_id,
+                dry_run=self.dry_run,
+            )
+
+        self._write_state()
+
+        result = {
+            "maintenance_required": maintenance_needed,
+            "performance_drift":    drift_detected,
+            "days_since_training":  days_since_training,
+            "days_since_ath":       days_since_ath,
+        }
+
+        if maintenance_needed or drift_detected:
+            logger.info(
+                "Model integrity | maintenance=%s  drift=%s  "
+                "train_age=%dd  ath_age=%dd",
+                maintenance_needed, drift_detected,
+                days_since_training, days_since_ath,
+            )
+
+        return result
+
     # ── Full cycle ────────────────────────────────────────────────────────────
 
     def run_cycle(self) -> dict:
@@ -930,9 +1061,10 @@ class PaperTrader:
         Full paper trading cycle — call every 4h at candle close.
 
         Order:
-          1. check_exits()      — close any TP / SL / time-hit trades + alert
-          2. _check_and_halt()  — evaluate circuit breaker
-          3. scan()             — find new signals + open trades + alert
+          1. check_exits()            — close any TP / SL / time-hit trades + alert
+          2. _check_and_halt()        — evaluate circuit breaker
+          3. check_model_integrity()  — walk-forward maintenance monitor
+          4. scan()                   — find new signals + open trades + alert
 
         Returns summary dict.
         """
@@ -943,10 +1075,12 @@ class PaperTrader:
         self._refresh_cache()
         closed = self.check_exits()
         halted = self._check_and_halt()
+        integrity = self.check_model_integrity()
 
         if halted:
             logger.info("Scan skipped (halted).")
-            return {"closed": closed, "opened": [], "halted": True}
+            return {"closed": closed, "opened": [], "halted": True,
+                    "integrity": integrity}
 
         opened = self.scan()
 
@@ -966,7 +1100,8 @@ class PaperTrader:
                 self._bot_token, self._chat_id, dry_run=self.dry_run,
             )
 
-        return {"closed": closed, "opened": opened, "halted": False}
+        return {"closed": closed, "opened": opened, "halted": False,
+                "integrity": integrity}
 
     # ── CSV logging ───────────────────────────────────────────────────────────
 
@@ -1056,6 +1191,25 @@ class PaperTrader:
         print(f"  Halted:        {'YES 🚨' if self.state.get('halted') else 'No'}")
         print(f"  Open trades:   {len(self.state['open_trades'])}")
         print(f"  Closed trades: {len(closed)}")
+
+        # Walk-forward maintenance monitor status
+        from datetime import date as _date
+        _today = datetime.now(timezone.utc).date()
+        _last_train = self.state.get("last_training_date", _today.isoformat())
+        _train_age = (_today - _date.fromisoformat(_last_train)).days
+        _peak_dt = self.state.get("peak_equity_date", _today.isoformat())
+        _ath_age = (_today - _date.fromisoformat(_peak_dt)).days
+        _maint = self.state.get("maintenance_required", False)
+        _drift = self.state.get("performance_drift", False)
+        print(f"\n  ── Model Integrity ──")
+        print(f"  Last trained:  {_last_train}  ({_train_age}d ago, "
+              f"limit {self._RETRAIN_CYCLE_DAYS}d)")
+        print(f"  Last ATH:      {_peak_dt}  ({_ath_age}d ago, "
+              f"limit {self._ATH_STAGNATION_DAYS}d)")
+        if _maint:
+            print(f"  ⚠ MAINTENANCE_REQUIRED — retrain with walk-forward update")
+        if _drift:
+            print(f"  ⚠ PERFORMANCE_DRIFT — no new ATH for {_ath_age} days")
 
         if self.state["open_trades"]:
             print("\n  ── Open Positions ──")

@@ -22,11 +22,12 @@
 12. [Blind Test Results](#12-blind-test-results)
     - [Blind Test 1 — Nov 2025 – Jan 2026](#blind-test-1--nov-01-2025--jan-24-2026)
     - [Blind Test 2 — Jan 2026 – Mar 2026](#blind-test-2--jan-24-2026--mar-09-2026)
-13. [Strengths](#13-strengths)
-14. [Weaknesses](#14-weaknesses)
-15. [How to Run (Step-by-Step)](#15-how-to-run-step-by-step)
-16. [File Structure](#16-file-structure)
-17. [Configuration Reference](#17-configuration-reference)
+13. [Adaptive Walk-Forward Maintenance Monitor](#13-adaptive-walk-forward-maintenance-monitor)
+14. [Strengths](#14-strengths)
+15. [Weaknesses](#15-weaknesses)
+16. [How to Run (Step-by-Step)](#16-how-to-run-step-by-step)
+17. [File Structure](#17-file-structure)
+18. [Configuration Reference](#18-configuration-reference)
 
 ---
 
@@ -442,7 +443,49 @@ Both blind tests use data the optimizer and backtest engine **never saw**. One f
 
 ---
 
-## 13. Strengths
+## 13. Adaptive Walk-Forward Maintenance Monitor
+
+The system includes an automated model integrity monitor (`check_model_integrity()`) that runs at every 4-hour bar close as part of the standard `run_cycle()` lifecycle. It enforces two maintenance rules and defines a Champion-Challenger verification process for model updates.
+
+### Rule A — Fixed Sliding Window (120-Day Retraining Cycle)
+
+The system tracks `last_training_date` in persistent state. When the elapsed time exceeds **120 days**, a `MAINTENANCE_REQUIRED` flag is set and a critical Telegram alert is sent.
+
+**Retraining protocol:**
+1. Drop the oldest data fold from the 10-fold sliding window
+2. Format the latest 120 days of live market data as the new "Test Fold"
+3. Retrain the model on the updated fold structure
+4. Validate via the Champion-Challenger process (see below)
+
+This ensures the model's training window evolves with market conditions and prevents stale parameter sets from persisting indefinitely.
+
+### Rule B — Dynamic Stagnation Check (30-Day Performance Drift)
+
+The system continuously monitors the equity curve. If the portfolio fails to reach a new **Equity All-Time High (ATH)** for **30 consecutive days**, a `PERFORMANCE_DRIFT_ALERT` is triggered.
+
+This acts as an emergency circuit breaker to re-evaluate the model's alignment with current market volatility. Unlike the daily loss / drawdown circuit breaker (which halts trading), the performance drift alert signals that the model itself may need retraining — not just a pause.
+
+**State tracking:**
+- `peak_equity_date` — date of the most recent equity ATH
+- `performance_drift` — boolean flag, reset when a new ATH is reached
+
+### Champion-Challenger Verification Process
+
+Before any newly trained model replaces the live production model, the following verification steps must be completed:
+
+| Step | Description | Pass Criteria |
+|------|-------------|---------------|
+| 1. Train Challenger | Retrain on updated fold structure with latest data | Model converges, no errors |
+| 2. Blind Backtest | Run challenger on the most recent 30–60 days of data it has never seen | Positive PnL, WR >= 41% for longs |
+| 3. Side-by-Side | Run both champion and challenger in parallel (paper mode) for >= 2 full 4h cycles | Challenger signals are comparable or better |
+| 4. Metric Gate | Compare Sharpe, Profit Factor, Max DD, Win Rate | Challenger must not degrade any metric by > 10% |
+| 5. Promote | If all gates pass, replace champion with challenger and update `last_training_date` | Manual approval required |
+
+The champion (current live model) continues trading during the entire verification process. The challenger never touches live equity until promoted.
+
+---
+
+## 14. Strengths
 
 ### Methodological Strengths
 
@@ -470,7 +513,7 @@ Both blind tests use data the optimizer and backtest engine **never saw**. One f
 
 ---
 
-## 14. Weaknesses
+## 15. Weaknesses
 
 ### Performance Weaknesses
 
@@ -498,7 +541,7 @@ Both blind tests use data the optimizer and backtest engine **never saw**. One f
 
 ---
 
-## 15. How to Run (Step-by-Step)
+## 16. How to Run (Step-by-Step)
 
 ### Prerequisites
 
@@ -590,7 +633,7 @@ python run_blind_test_v57.py
 
 ---
 
-## 16. File Structure
+## 17. File Structure
 
 ```
 varanusv57/
@@ -639,7 +682,7 @@ varanusv57/
 
 ---
 
-## 17. Configuration Reference
+## 18. Configuration Reference
 
 ### best_params_v57.json — Full Parameter Set
 
