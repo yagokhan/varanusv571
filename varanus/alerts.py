@@ -18,7 +18,7 @@ REQUIRED_FIELDS = [
 
 # ── Exit alert ────────────────────────────────────────────────────────────────
 EXIT_FORMAT = (
-    "🔒 *VARANUS v5.7.1 EXIT* | {asset} {outcome}\n"
+    "🔒 *VARANUS v5.7.1 EXIT* | {asset} {direction} {outcome}\n"
     "Entry: {entry_price:.4f} → Exit: {exit_price:.4f}\n"
     "PnL: {pnl_sign}${pnl_abs:.2f} ({pnl_sign}{pnl_pct:.2f}%) | Duration: {duration_h:.0f}h\n"
     "Outcome: {outcome_label}"
@@ -95,8 +95,11 @@ def send_exit_alert(trade: dict, bot_token: str, chat_id: str,
     pnl = trade.get("pnl_usd", 0.0)
     position = trade.get("position_usd", 0.0)
     pnl_pct = abs(pnl) / position * 100 if position else 0.0
+    direction = trade.get("direction", 1)
+    dir_label = "LONG ↑" if direction == 1 else "SHORT ↓"
     msg = EXIT_FORMAT.format(
         asset         = trade.get("asset", "?"),
+        direction     = dir_label,
         outcome       = outcome.upper(),
         entry_price   = float(trade.get("entry_price", 0)),
         exit_price    = float(trade.get("exit_price", 0)),
