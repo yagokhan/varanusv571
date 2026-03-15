@@ -1,0 +1,18 @@
+{
+    "mss_lookback": 31,
+    "fvg_min_atr_ratio": 0.392,
+    "sweep_min_pct": 0.00641,
+    "fvg_max_age": 22,
+    "rvol_threshold": 1.287,
+    "rsi_oversold": 36,
+    "rsi_overbought": 58,
+    "max_holding": 31,
+    "xgb_n_estimators": 218,
+    "xgb_subsample": 0.957,
+    "confidence_thresh": 0.7860572350348888,
+    "sl_atr_mult": 0.7091859094186275,
+    "tp_atr_mult": 5.768387250199972,
+    "leverage_5x_trigger": 0.9676966378615275,
+    "xgb_lr": 0.060884936946609944,
+    "xgb_max_depth": 6
+}

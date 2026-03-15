@@ -322,6 +322,20 @@ class PaperTrader:
     # ── Live data fetching ────────────────────────────────────────────────────
 
     _BINANCE_KLINES = "https://api.binance.com/api/v3/klines"
+    _BINANCE_TICKER = "https://api.binance.com/api/v3/ticker/price"
+
+    def fetch_spot_prices(self, assets: list[str]) -> dict[str, float]:
+        """Fetch current spot prices from Binance for a list of assets."""
+        prices = {}
+        for asset in assets:
+            sym = f"{asset}USDT"
+            try:
+                r = requests.get(self._BINANCE_TICKER, params={"symbol": sym}, timeout=5)
+                if r.status_code == 200:
+                    prices[asset] = float(r.json()["price"])
+            except Exception:
+                pass
+        return prices
 
     # Max bars to keep in cache (4h bars) — ~3 years, enough for training + live
     _CACHE_MAX_4H = 6500
@@ -443,6 +457,8 @@ class PaperTrader:
             updated += 1
             time.sleep(0.05)   # be polite to the public API
 
+        self.state["last_cache_refresh"] = datetime.now(timezone.utc).isoformat()
+        self.state["last_cache_ok"] = updated >= len(TIER2_UNIVERSE) - 1
         logger.info("Cache refresh done — %d/%d assets updated.", updated, len(TIER2_UNIVERSE))
 
     def _fetch_live(self, asset: str, tf: str, limit: int) -> Optional[pd.DataFrame]:
@@ -888,12 +904,15 @@ class PaperTrader:
             )
 
             sign = "+" if pnl_usd >= 0 else ""
+            pos_usd = trade.get("position_usd", 0.0)
+            pnl_pct = pnl_usd / pos_usd * 100 if pos_usd else 0.0
             logger.info(
-                "CLOSED  %-6s  %s  exit=%.6f  PnL=%s$%.2f  equity=$%.2f",
+                "CLOSED  %-6s  %s  exit=%.6f  PnL=%s$%.2f (%s%.2f%%)  equity=$%.2f",
                 asset,
                 outcome["type"].upper(),
                 exit_price,
                 sign, abs(pnl_usd),
+                sign, abs(pnl_pct),
                 self.state["equity"],
             )
 
@@ -1240,13 +1259,18 @@ class PaperTrader:
         opened = self.scan()
 
         h = self.get_health()
+        all_closed = self.state.get("closed_trades", [])
+        total_deployed = sum(t.get("position_usd", 0.0) for t in all_closed)
+        total_pnl_closed = sum(t.get("pnl_usd", 0.0) for t in all_closed)
+        roi_pct = total_pnl_closed / total_deployed * 100 if total_deployed else 0.0
         logger.info(
             "Cycle done | open=%d  closed=%d  new=%d  equity=$%.2f  "
-            "daily=%.1f%%  dd=%.1f%%",
+            "daily=%.1f%%  dd=%.1f%%  deployed=$%.2f  PnL=$%.2f (%.2f%%)",
             len(self.state["open_trades"]),
             len(closed), len(opened),
             h["current_equity"],
             h["daily_loss_pct"], h["drawdown_pct"],
+            total_deployed, total_pnl_closed, roi_pct,
         )
 
         if not opened:
@@ -1317,10 +1341,13 @@ class PaperTrader:
                     if text in ("heartbeat", "/status", "status", "/start"):
                         logger.info("Status request received: '%s'", text)
                         health = self.get_health()
+                        open_assets = list(self.state.get("open_trades", {}).keys())
+                        live_prices = self.fetch_spot_prices(open_assets) if open_assets else {}
                         send_heartbeat_alert(
                             self.state, health,
                             self._bot_token, self._chat_id,
                             next_cycle_mins=self._mins_to_next_cycle(),
+                            live_prices=live_prices,
                         )
             except Exception as exc:
                 logger.debug("Telegram poll error: %s", exc)
